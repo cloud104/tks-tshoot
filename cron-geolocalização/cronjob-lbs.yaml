@@ -1,0 +1,160 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nemesis-lb-geo-fix
+  namespace: kube-system
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+
+          nodeSelector:
+            node-pool: worker-system
+
+          tolerations:
+            - key: "node-pool"
+              operator: "Equal"
+              value: "worker-system"
+              effect: "NoSchedule"
+
+          containers:
+            - name: geo-fix
+              image: alpine/curl:8.14.1
+              command: ["/bin/sh", "-c"]
+              env:
+                - name: NEMESIS_API_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: tcloud-credentials
+                      key: api-url
+
+                - name: ORG_ID_OVERRIDE
+                  value: "05fbff14-bf47-11ed-921b-005056bf7c18"
+
+                - name: NEMESIS_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: tcloud-credentials
+                      key: username
+                - name: NEMESIS_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: tcloud-credentials
+                      key: password
+
+              args:
+                - |
+                  set -euo pipefail
+
+                  apk add --no-cache jq coreutils
+
+                  API_URL="$NEMESIS_API_URL"
+                  ORG_ID_DEC="$ORG_ID_OVERRIDE"
+                  USER="$NEMESIS_USER"
+                  PASS="$NEMESIS_PASS"
+
+                  BASIC_AUTH="$(printf "%s:%s" "$USER" "$PASS" | base64 -w 0)"
+
+                  PUBLIC_ADDRESS_ID="984e8acb-bf54-11ed-928b-005056bf7c18"
+
+                  LBS="
+                  80:11ac5704-6add-11ef-8141-005056bf7c18
+                  443:12755c36-6ad9-11ef-8116-005056bf7c18
+                  "
+
+                  TOKEN=$(
+                    curl -s --request POST \
+                      --url "${API_URL}/v1/tokens" \
+                      --header "Authorization: Basic ${BASIC_AUTH}" \
+                      --header "Content-Type: application/x-www-form-urlencoded" \
+                      --header "grant: password" \
+                      --data "grant_type=password" \
+                    | jq -r '.access_token // .token // empty'
+                  )
+
+                  if [ -z "$TOKEN" ]; then
+                    echo "ERRO: não consegui obter token no Nemesis"
+                    exit 1
+                  fi
+
+                  for ENTRY in $LBS; do
+                    VIP_PORT="${ENTRY%%:*}"
+                    LB_ID="${ENTRY##*:}"
+
+                    LB_URL="${API_URL}/v1/organizations/${ORG_ID_DEC}/public-address/${PUBLIC_ADDRESS_ID}/load-balancers/${LB_ID}"
+
+                    echo "DEBUG: consultando LB ${LB_ID} (porta ${VIP_PORT})"
+                    echo "DEBUG: GET ${LB_URL}"
+
+                    RESP_FILE="/tmp/lb_${LB_ID}.json"
+                    HTTP_CODE=$(
+                      curl -s -o "${RESP_FILE}" -w "%{http_code}" \
+                        --request GET \
+                        --url "${LB_URL}" \
+                        --header "Authorization: Bearer ${TOKEN}"
+                    )
+
+                    if [ "${HTTP_CODE}" != "200" ]; then
+                      echo "ERRO: GET falhou para LB ${LB_ID} (porta ${VIP_PORT}) HTTP=${HTTP_CODE}"
+                      echo "DEBUG body: $(cat "${RESP_FILE}")"
+                      echo "SKIP: não vou aplicar PUT nesse LB"
+                      continue
+                    fi
+
+                    LB_JSON="$(cat "${RESP_FILE}")"
+
+                    if ! echo "$LB_JSON" | jq -e . >/dev/null 2>&1; then
+                      echo "ERRO: GET retornou body inválido (não é JSON) para LB ${LB_ID} (porta ${VIP_PORT})"
+                      echo "DEBUG bruto: $LB_JSON"
+                      echo "SKIP: não vou aplicar PUT nesse LB"
+                      continue
+                    fi
+
+                    HAS_SOURCES=$(
+                      echo "$LB_JSON" | jq -e 'has("Sources")' >/dev/null 2>&1 && echo true || echo false
+                    )
+
+                    if [ "$HAS_SOURCES" = "true" ]; then
+                      echo "OK: LB ${LB_ID} (porta ${VIP_PORT}) já possui o campo Sources. Não vou aplicar PUT."
+                      continue
+                    fi
+
+                    echo "FALTA o campo Sources no LB ${LB_ID} (porta ${VIP_PORT}) - aplicando PUT..."
+
+                    UPDATED_PAYLOAD=$(
+                      echo "$LB_JSON" | jq '
+                        .Sources = [
+                          { "Source": "BR", "Type": "region" },
+                          { "Source": "US", "Type": "region" },
+                          { "Source": "IL", "Type": "region" },
+                          { "Source": "GB", "Type": "region" },
+                          { "Source": "PT", "Type": "region" },
+                          { "Source": "CA", "Type": "region" }
+                        ]
+                      '
+                    )
+
+                    PUT_CODE=$(
+                      curl -s -o /tmp/put_${LB_ID}.out -w "%{http_code}" \
+                        --request PUT \
+                        --url "${LB_URL}" \
+                        --header "Authorization: Bearer ${TOKEN}" \
+                        --header "Content-Type: application/json" \
+                        --data "${UPDATED_PAYLOAD}"
+                    )
+
+                    if [ "${PUT_CODE}" != "200" ] && [ "${PUT_CODE}" != "204" ]; then
+                      echo "ERRO: PUT falhou para LB ${LB_ID} (porta ${VIP_PORT}) HTTP=${PUT_CODE}"
+                      echo "DEBUG PUT body: $(cat /tmp/put_${LB_ID}.out)"
+                      exit 1
+                    fi
+
+                    echo "DONE: LB ${LB_ID} atualizado (porta ${VIP_PORT})"
+                  done
